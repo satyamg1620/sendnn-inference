@@ -847,6 +847,59 @@ class ChunkedPrefillModelRunner(
     def _prepare_prompt(self, new_request_data: list[NewRequestData]) -> SamplingForwardInputs:
         raise NotImplementedError
 
+    def _compute_or_broadcast_mm_embeddings(
+        self,
+        full_input_tokens: torch.Tensor,
+        mm_features: list,
+        prompt_len: int,
+    ) -> torch.Tensor:
+        """Compute multimodal embeddings once per request and share with TP peers.
+
+        The vision tower runs on CPU, so executing it on every TP worker wastes
+        linear-in-TP CPU work. Instead, rank 0 runs the encoder and broadcasts
+        the resulting [1, prompt_len, hidden_size] tensor over the TP group;
+        peers pre-allocate a receive buffer and skip the encoder entirely.
+        """
+        world_size = self.parallel_config.world_size
+        if world_size <= 1:
+            # Single-worker path: nothing to broadcast, behave as before.
+            return self.model.get_maybe_mm_embeddings(
+                full_input_tokens,
+                mm_features=mm_features,
+                is_decode=False,
+            )
+
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_group = get_tp_group()
+        hidden_size = self.model.mm_model_utils.get_text_hidden_size()
+        dtype = self.model.dtype
+
+        if self.rank == 0:
+            full_embeds = self.model.get_maybe_mm_embeddings(
+                full_input_tokens,
+                mm_features=mm_features,
+                is_decode=False,
+            )
+            expected_shape = (1, prompt_len, hidden_size)
+            assert tuple(full_embeds.shape) == expected_shape, (
+                f"mm embedding shape {tuple(full_embeds.shape)} does not match "
+                f"expected {expected_shape}; peer ranks pre-allocate this shape"
+            )
+            assert full_embeds.dtype == dtype, (
+                f"mm embedding dtype {full_embeds.dtype} does not match "
+                f"self.model.dtype {dtype}; peer ranks pre-allocate this dtype"
+            )
+        else:
+            full_embeds = torch.empty(
+                (1, prompt_len, hidden_size),
+                dtype=dtype,
+                device=self.device,
+            )
+
+        tp_group.broadcast(full_embeds, src=0)
+        return full_embeds
+
     def _prepare_chunked_prefill(self, req_id: str) -> SamplingForwardInputs:
         """
         Cases / Scenarios for the chunked prefill with right padding.
@@ -1035,16 +1088,18 @@ class ChunkedPrefillModelRunner(
         # and cache them, then slice per chunk. This ensures image features are
         # correctly aligned across all chunks.
         if mm_features and request.cached_mm_embeddings is None:
-            # First chunk: compute full multimodal embeddings
+            # First chunk: compute full multimodal embeddings. Under TP, only
+            # rank 0 runs the (CPU) vision tower; peers receive the result via
+            # broadcast and skip the encoder.
             full_input_tokens = torch.tensor(
                 prompt_token_ids, dtype=torch.int64, device=self.device
             ).unsqueeze(0)
 
             t0 = time.time()
-            full_embeds = self.model.get_maybe_mm_embeddings(
+            full_embeds = self._compute_or_broadcast_mm_embeddings(
                 full_input_tokens,
                 mm_features=mm_features,
-                is_decode=False,
+                prompt_len=prompt_len,
             )
 
             t_elapsed = time.time() - t0
@@ -1056,6 +1111,7 @@ class ChunkedPrefillModelRunner(
                 phase="prefill",
                 has_mm_features=True,
                 req_id=req_id,
+                rank=self.rank,
             )
 
             # Cache the full embeddings for subsequent chunks

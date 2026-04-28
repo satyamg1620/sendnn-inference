@@ -9,7 +9,6 @@ from transformers import AutoModel, AutoModelForSequenceClassification, AutoToke
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.pooler.activations import get_act_fn
 from vllm.model_executor.layers.pooler.seqwise.poolers import (
     pooler_for_classify,
     pooler_for_embed,
@@ -365,6 +364,8 @@ class SpyrePoolingModelRunner(
             with set_current_vllm_config(self.vllm_config):
                 self.pooler = pooler_for_embed(pooler_config=pooler_config)
         elif task == "classify":
+            from vllm.model_executor.layers.pooler.activations import get_act_fn
+
             with set_current_vllm_config(self.vllm_config):
                 self.pooler = pooler_for_classify(
                     pooler_config=pooler_config,
@@ -857,9 +858,16 @@ class ChunkedPrefillModelRunner(
 
         The vision tower runs on CPU, so executing it on every TP worker wastes
         linear-in-TP CPU work. Instead, rank 0 runs the encoder and broadcasts
-        the resulting [1, prompt_len, hidden_size] tensor over the TP group;
-        peers pre-allocate a receive buffer and skip the encoder entirely.
+        the resulting tensor over the TP group; peers skip the encoder and
+        receive into a pre-allocated buffer.
+
+        Rank 0 first broadcasts (shape, dtype) so peers don't have to assume
+        either — this keeps the helper safe even when the encoder returns a
+        dtype that differs from self.model.dtype (e.g. bf16 input pixel_values
+        flowing through to bf16 embeddings on an fp16-targeted model).
         """
+        del prompt_len  # shape is broadcast from rank 0; arg kept for caller compatibility
+
         world_size = self.parallel_config.world_size
         if world_size <= 1:
             # Single-worker path: nothing to broadcast, behave as before.
@@ -872,8 +880,6 @@ class ChunkedPrefillModelRunner(
         from vllm.distributed.parallel_state import get_tp_group
 
         tp_group = get_tp_group()
-        hidden_size = self.model.mm_model_utils.get_text_hidden_size()
-        dtype = self.model.dtype
 
         if self.rank == 0:
             full_embeds = self.model.get_maybe_mm_embeddings(
@@ -881,21 +887,20 @@ class ChunkedPrefillModelRunner(
                 mm_features=mm_features,
                 is_decode=False,
             )
-            expected_shape = (1, prompt_len, hidden_size)
-            assert tuple(full_embeds.shape) == expected_shape, (
-                f"mm embedding shape {tuple(full_embeds.shape)} does not match "
-                f"expected {expected_shape}; peer ranks pre-allocate this shape"
-            )
-            assert full_embeds.dtype == dtype, (
-                f"mm embedding dtype {full_embeds.dtype} does not match "
-                f"self.model.dtype {dtype}; peer ranks pre-allocate this dtype"
-            )
+            meta = [tuple(full_embeds.shape), str(full_embeds.dtype)]
         else:
-            full_embeds = torch.empty(
-                (1, prompt_len, hidden_size),
-                dtype=dtype,
-                device=self.device,
-            )
+            meta = [None, None]
+
+        # Sync shape/dtype before the tensor broadcast so peers can allocate a
+        # matching receive buffer. Critical: any failure on rank 0 prior to the
+        # tensor broadcast would otherwise leave peers hung in gloo forever.
+        tp_group.broadcast_object_list(meta, src=0)
+        shape, dtype_str = meta
+
+        if self.rank != 0:
+            # dtype string is e.g. "torch.float16"; resolve back to a torch.dtype
+            dtype = getattr(torch, dtype_str.removeprefix("torch."))
+            full_embeds = torch.empty(shape, dtype=dtype, device=self.device)
 
         tp_group.broadcast(full_embeds, src=0)
         return full_embeds

@@ -882,6 +882,7 @@ class ChunkedPrefillModelRunner(
         tp_group = get_tp_group()
 
         if self.rank == 0:
+            logger.info("rank 0: computing multimodal embeddings (vision encoder)")
             full_embeds = self.model.get_maybe_mm_embeddings(
                 full_input_tokens,
                 mm_features=mm_features,
@@ -889,6 +890,7 @@ class ChunkedPrefillModelRunner(
             )
             meta = [tuple(full_embeds.shape), str(full_embeds.dtype)]
         else:
+            logger.info("rank %d: awaiting multimodal embeddings broadcast from rank 0", self.rank)
             meta = [None, None]
 
         # Sync shape/dtype before the tensor broadcast so peers can allocate a

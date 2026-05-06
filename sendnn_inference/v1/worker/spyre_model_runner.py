@@ -733,6 +733,9 @@ class ChunkedPrefillModelRunner(
         # keeps a single CPU encoder in flight at a time.
         self._mm_executor: ThreadPoolExecutor | None = None
         self._mm_futures: dict[str, Future[torch.Tensor]] = {}
+        # Wallclock at submit time, used to measure how much of the encode
+        # we successfully hid behind chunk-prep before the main thread joins.
+        self._mm_submit_times: dict[str, float] = {}
         if self.parallel_config.world_size > 1:
             self._mm_executor = ThreadPoolExecutor(
                 max_workers=1,
@@ -863,6 +866,30 @@ class ChunkedPrefillModelRunner(
     def _prepare_prompt(self, new_request_data: list[NewRequestData]) -> SamplingForwardInputs:
         raise NotImplementedError
 
+    @staticmethod
+    def _get_mm_tp_group():
+        """Return the TP group, asserting it is gloo.
+
+        The worker-thread design (rank 0 encodes/broadcasts and peers
+        receive on a `ThreadPoolExecutor` thread) is only safe because
+        gloo serializes collectives via internal mutexes. NCCL or other
+        backends do not guarantee thread safety, so a backend change must
+        revisit this design — this assertion makes that contract explicit.
+        """
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_group = get_tp_group()
+        # The CPU subgroup is what gloo broadcasts route through for CPU
+        # tensors; this is the channel we actually use here.
+        backend = dist.get_backend(tp_group.cpu_group)
+        assert backend == "gloo", (
+            "Async MM broadcast requires the TP cpu_group to be gloo "
+            f"(got {backend!r}). Cross-thread torch.distributed collectives "
+            "are undefined behavior on non-gloo backends."
+        )
+        return tp_group
+
     def _mm_encode_and_broadcast(
         self,
         full_input_tokens: torch.Tensor,
@@ -876,9 +903,7 @@ class ChunkedPrefillModelRunner(
         in their own broadcast call — then re-raise locally so the future
         reports the failure to the main thread.
         """
-        from vllm.distributed.parallel_state import get_tp_group
-
-        tp_group = get_tp_group()
+        tp_group = self._get_mm_tp_group()
 
         try:
             t0 = time.time()
@@ -890,6 +915,12 @@ class ChunkedPrefillModelRunner(
                 full_input_tokens,
                 mm_features=mm_features,
                 is_decode=False,
+            )
+            # gloo broadcast requires the tensor on CPU. Catch any future
+            # change in encoder placement before it turns into a hang.
+            assert full_embeds.device.type == "cpu", (
+                f"MM embedding must be a CPU tensor for gloo broadcast; "
+                f"got {full_embeds.device}"
             )
             self.perf_logger.log(
                 "mm_encode_time_ms",
@@ -920,15 +951,14 @@ class ChunkedPrefillModelRunner(
         thread can do other chunk-prep work in parallel and only pays the
         residual encode time when it eventually awaits the future.
         """
-        from vllm.distributed.parallel_state import get_tp_group
-
-        tp_group = get_tp_group()
+        tp_group = self._get_mm_tp_group()
 
         logger.info(
             "rank %d: awaiting multimodal embeddings broadcast for req '%s'",
             self.rank,
             req_id,
         )
+        t0 = time.time()
         meta = [None, None]
         tp_group.broadcast_object_list(meta, src=0)
         shape, dtype_str = meta
@@ -939,8 +969,25 @@ class ChunkedPrefillModelRunner(
             )
 
         dtype = getattr(torch, dtype_str.removeprefix("torch."))
-        full_embeds = torch.empty(shape, dtype=dtype, device=self.device)
+        # CPU explicit: matches rank 0's encoder output and gloo's CPU broadcast
+        # contract. Was previously self.device, which on Spyre is the AIU device
+        # — would be wrong if anyone ever changed encoder placement.
+        full_embeds = torch.empty(shape, dtype=dtype, device="cpu")
         tp_group.broadcast(full_embeds, src=0)
+        t_recv = time.time() - t0
+        logger.info(
+            "rank %d: received MM broadcast for req '%s' in %.2fms",
+            self.rank,
+            req_id,
+            t_recv * 1000,
+        )
+        self.perf_logger.log(
+            "mm_recv_broadcast_ms",
+            t_recv * 1000,
+            phase="prefill",
+            req_id=req_id,
+            rank=self.rank,
+        )
         return full_embeds
 
     def _maybe_submit_mm_encode(self, request: "NewRequestData") -> None:
@@ -960,7 +1007,7 @@ class ChunkedPrefillModelRunner(
 
         req_id = request.req_id
         if req_id in self._mm_futures:
-            # First chunk only; defensive guard against duplicate submits.
+            # Already submitted on a previous chunk; skip the duplicate.
             return
 
         if self.rank == 0:
@@ -976,44 +1023,84 @@ class ChunkedPrefillModelRunner(
         else:
             future = self._mm_executor.submit(self._mm_receive_broadcast, req_id)
         self._mm_futures[req_id] = future
+        self._mm_submit_times[req_id] = time.time()
+        logger.info(
+            "rank %d: submitted async MM %s for req '%s'",
+            self.rank,
+            "encode" if self.rank == 0 else "recv",
+            req_id,
+        )
 
     def _compute_or_broadcast_mm_embeddings(
         self,
-        full_input_tokens: torch.Tensor,
+        prompt_token_ids: list[int],
         mm_features: list,
-        prompt_len: int,
-        req_id: str | None = None,
+        req_id: str,
     ) -> torch.Tensor:
         """Return the multimodal embedding for this request.
 
-        Under TP > 1 the encode + broadcast pair is dispatched to a
-        background thread by `_maybe_submit_mm_encode`; here we just join
-        that future. If for some reason the early submit didn't happen
-        (e.g. caller path that bypasses maybe_setup_new_prefill), we fall
-        back to running the encode/recv inline.
-        """
-        del prompt_len  # shape is broadcast from rank 0; kept for caller compat
+        TP=1: run the encoder synchronously on the main thread.
 
+        TP>1: the encode + broadcast pair was dispatched to a background
+        thread by `_maybe_submit_mm_encode` during `maybe_setup_new_prefill`,
+        so here we just join that future. If the future is missing we fail
+        loudly rather than fall back to an inline encode — an asymmetric
+        sync/async mix across ranks would deadlock the gloo collective.
+        """
         world_size = self.parallel_config.world_size
         if world_size <= 1:
+            full_input_tokens = torch.tensor(
+                prompt_token_ids, dtype=torch.int64, device=self.device
+            ).unsqueeze(0)
             return self.model.get_maybe_mm_embeddings(
                 full_input_tokens,
                 mm_features=mm_features,
                 is_decode=False,
             )
 
-        if req_id is not None and req_id in self._mm_futures:
-            future = self._mm_futures.pop(req_id)
-            return future.result()
-
-        # Fallback inline path: no early submit happened, so the main
-        # thread runs the synchronous version. Functionally identical to
-        # the pre-async behavior for one request.
-        if self.rank == 0:
-            return self._mm_encode_and_broadcast(
-                full_input_tokens, mm_features, req_id or "?"
+        if req_id not in self._mm_futures:
+            raise RuntimeError(
+                f"MM future missing for req '{req_id}' under TP > 1. "
+                "_maybe_submit_mm_encode must have run in maybe_setup_new_prefill "
+                "before this call. Falling through to an inline encode/recv would "
+                "deadlock if any peer rank took a different branch."
             )
-        return self._mm_receive_broadcast(req_id or "?")
+
+        future = self._mm_futures.pop(req_id)
+        t_submit = self._mm_submit_times.pop(req_id, None)
+
+        t_join_start = time.time()
+        already_done = future.done()
+        full_embeds = future.result()
+        t_wait = time.time() - t_join_start
+
+        if t_submit is not None:
+            t_overlap_window = t_join_start - t_submit
+            logger.info(
+                "rank %d: joined MM future for req '%s' "
+                "[overlap_window=%.2fms wait=%.2fms encode_done_before_join=%s]",
+                self.rank,
+                req_id,
+                t_overlap_window * 1000,
+                t_wait * 1000,
+                already_done,
+            )
+            self.perf_logger.log(
+                "mm_overlap_window_ms",
+                t_overlap_window * 1000,
+                phase="prefill",
+                req_id=req_id,
+                rank=self.rank,
+            )
+            self.perf_logger.log(
+                "mm_join_wait_ms",
+                t_wait * 1000,
+                phase="prefill",
+                req_id=req_id,
+                rank=self.rank,
+                encode_done_before_join=already_done,
+            )
+        return full_embeds
 
     def _prepare_chunked_prefill(self, req_id: str) -> SamplingForwardInputs:
         """
@@ -1205,16 +1292,13 @@ class ChunkedPrefillModelRunner(
         if mm_features and request.cached_mm_embeddings is None:
             # First chunk: compute full multimodal embeddings. Under TP, only
             # rank 0 runs the (CPU) vision tower; peers receive the result via
-            # broadcast and skip the encoder.
-            full_input_tokens = torch.tensor(
-                prompt_token_ids, dtype=torch.int64, device=self.device
-            ).unsqueeze(0)
-
+            # broadcast and skip the encoder. For TP=1 the helper builds the
+            # input tensor itself; for TP>1 the work was already submitted in
+            # maybe_setup_new_prefill and we just join the future here.
             t0 = time.time()
             full_embeds = self._compute_or_broadcast_mm_embeddings(
-                full_input_tokens,
+                prompt_token_ids,
                 mm_features=mm_features,
-                prompt_len=prompt_len,
                 req_id=req_id,
             )
 
@@ -1634,9 +1718,16 @@ class ChunkedPrefillModelRunner(
         if scheduler_output.finished_req_ids:
             for req_id in scheduler_output.finished_req_ids:
                 self.input_batch.remove_request(req_id)
-                # If a request finishes (or is aborted) before we joined
-                # its async MM future, drop it so we don't leak a Future.
+                # If a request finishes (or is aborted) before we joined its
+                # async MM future, stop tracking it locally — but DO NOT
+                # call .cancel() on the future. Cancelling a queued encode
+                # on rank 0 while peers still have a queued matching recv
+                # (or vice versa) would deadlock the next request's gloo
+                # collective. Letting in-flight work complete wastes some
+                # CPU but preserves FIFO collective pairing across ranks,
+                # which is the safe correctness invariant.
                 self._mm_futures.pop(req_id, None)
+                self._mm_submit_times.pop(req_id, None)
                 # TODO: Processing multiple removals at once can break alignment
                 # of logitprocs. Refactor so that we can batch removals to the
                 # `input_batch`

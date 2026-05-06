@@ -111,19 +111,3 @@ class MMUtilsBase(ABC):
     @abstractmethod
     def get_multimodal_token_id(self) -> int:
         pass
-
-    def get_text_hidden_size(self) -> int:
-        """Return the hidden size of the text side of the multimodal model.
-
-        This is the last-dim of the tensor returned by
-        get_maybe_mm_embeddings, and must be consistent across TP ranks so
-        peers can pre-allocate a receive buffer for the broadcast of the
-        rank-0 vision embeddings.
-        """
-        text_config = getattr(self.hf_config, "text_config", None)
-        if text_config is None or not hasattr(text_config, "hidden_size"):
-            raise ValueError(
-                "hf_config has no text_config.hidden_size; override "
-                "get_text_hidden_size() for this architecture."
-            )
-        return text_config.hidden_size

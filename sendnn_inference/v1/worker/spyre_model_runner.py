@@ -864,8 +864,7 @@ class ChunkedPrefillModelRunner(
         tp_group = get_tp_group()
         backend = dist.get_backend(tp_group.cpu_group)
         assert backend == "gloo", (
-            "MM broadcast expects the TP cpu_group to be gloo "
-            f"(got {backend!r})."
+            f"MM broadcast expects the TP cpu_group to be gloo (got {backend!r})."
         )
         return tp_group
 
@@ -897,8 +896,7 @@ class ChunkedPrefillModelRunner(
             # gloo broadcast requires the tensor on CPU. Catch any future
             # change in encoder placement before it turns into a hang.
             assert full_embeds.device.type == "cpu", (
-                f"MM embedding must be a CPU tensor for gloo broadcast; "
-                f"got {full_embeds.device}"
+                f"MM embedding must be a CPU tensor for gloo broadcast; got {full_embeds.device}"
             )
             self.perf_logger.log(
                 "mm_encode_time_ms",
@@ -941,9 +939,7 @@ class ChunkedPrefillModelRunner(
         shape, dtype_str = meta
         if shape is None:
             # Rank 0 signalled an encoder failure via the meta channel.
-            raise RuntimeError(
-                f"rank 0 vision encoder failed for req '{req_id}': {dtype_str}"
-            )
+            raise RuntimeError(f"rank 0 vision encoder failed for req '{req_id}': {dtype_str}")
 
         dtype = getattr(torch, dtype_str.removeprefix("torch."))
         # CPU explicit: matches rank 0's encoder output and gloo's CPU broadcast
@@ -997,9 +993,7 @@ class ChunkedPrefillModelRunner(
             full_input_tokens = torch.tensor(
                 prompt_token_ids, dtype=torch.int64, device=self.device
             ).unsqueeze(0)
-            return self._mm_encode_and_broadcast(
-                full_input_tokens, mm_features, req_id
-            )
+            return self._mm_encode_and_broadcast(full_input_tokens, mm_features, req_id)
         return self._mm_receive_broadcast(req_id)
 
     def _prepare_chunked_prefill(self, req_id: str) -> SamplingForwardInputs:

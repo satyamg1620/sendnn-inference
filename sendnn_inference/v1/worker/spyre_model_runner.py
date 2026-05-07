@@ -9,7 +9,6 @@ from transformers import AutoModel, AutoModelForSequenceClassification, AutoToke
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.pooler.activations import get_act_fn
 from vllm.model_executor.layers.pooler.seqwise.poolers import (
     pooler_for_classify,
     pooler_for_embed,
@@ -365,6 +364,8 @@ class SpyrePoolingModelRunner(
             with set_current_vllm_config(self.vllm_config):
                 self.pooler = pooler_for_embed(pooler_config=pooler_config)
         elif task == "classify":
+            from vllm.model_executor.layers.pooler.activations import get_act_fn
+
             with set_current_vllm_config(self.vllm_config):
                 self.pooler = pooler_for_classify(
                     pooler_config=pooler_config,
@@ -847,6 +848,154 @@ class ChunkedPrefillModelRunner(
     def _prepare_prompt(self, new_request_data: list[NewRequestData]) -> SamplingForwardInputs:
         raise NotImplementedError
 
+    @staticmethod
+    def _get_mm_tp_group():
+        """Return the TP group, asserting its CPU subgroup is gloo.
+
+        The MM embedding lives on CPU (encoder runs on CPU), so the
+        broadcast routes through `tp_group.cpu_group`. On Spyre that
+        subgroup is gloo; this assertion makes the assumption explicit
+        so a future backend change surfaces as a clear error rather
+        than a wrong-tensor-device surprise inside the collective.
+        """
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_group = get_tp_group()
+        backend = dist.get_backend(tp_group.cpu_group)
+        assert backend == "gloo", (
+            f"MM broadcast expects the TP cpu_group to be gloo (got {backend!r})."
+        )
+        return tp_group
+
+    def _mm_encode_and_broadcast(
+        self,
+        full_input_tokens: torch.Tensor,
+        mm_features: list,
+        req_id: str,
+    ) -> torch.Tensor:
+        """Run the vision encoder on rank 0 and broadcast the embedding.
+
+        If the encoder raises, broadcast a sentinel meta payload so
+        peers don't deadlock in their own broadcast call, then re-raise
+        locally.
+        """
+        tp_group = self._get_mm_tp_group()
+
+        try:
+            t0 = time.time()
+            logger.info(
+                "rank 0: computing multimodal embeddings (vision encoder) for req '%s'",
+                req_id,
+            )
+            full_embeds = self.model.get_maybe_mm_embeddings(
+                full_input_tokens,
+                mm_features=mm_features,
+                is_decode=False,
+            )
+            # gloo broadcast requires the tensor on CPU. Catch any future
+            # change in encoder placement before it turns into a hang.
+            assert full_embeds.device.type == "cpu", (
+                f"MM embedding must be a CPU tensor for gloo broadcast; got {full_embeds.device}"
+            )
+            self.perf_logger.log(
+                "mm_encode_time_ms",
+                (time.time() - t0) * 1000,
+                phase="prefill",
+                has_mm_features=True,
+                req_id=req_id,
+                rank=self.rank,
+            )
+            meta = [tuple(full_embeds.shape), str(full_embeds.dtype)]
+        except Exception as exc:
+            logger.exception(
+                "rank 0: vision encoder failed for req '%s'; signalling peers to abort",
+                req_id,
+            )
+            tp_group.broadcast_object_list([None, repr(exc)], src=0)
+            raise
+
+        tp_group.broadcast_object_list(meta, src=0)
+        tp_group.broadcast(full_embeds, src=0)
+        return full_embeds
+
+    def _mm_receive_broadcast(self, req_id: str) -> torch.Tensor:
+        """Receive the multimodal embedding broadcast from rank 0.
+
+        Run on peer ranks. Allocates a CPU buffer of the shape/dtype
+        rank 0 advertised over the meta broadcast, then receives the
+        tensor into it.
+        """
+        tp_group = self._get_mm_tp_group()
+
+        logger.info(
+            "rank %d: awaiting multimodal embeddings broadcast for req '%s'",
+            self.rank,
+            req_id,
+        )
+        t0 = time.time()
+        meta = [None, None]
+        tp_group.broadcast_object_list(meta, src=0)
+        shape, dtype_str = meta
+        if shape is None:
+            # Rank 0 signalled an encoder failure via the meta channel.
+            raise RuntimeError(f"rank 0 vision encoder failed for req '{req_id}': {dtype_str}")
+
+        dtype = getattr(torch, dtype_str.removeprefix("torch."))
+        # CPU explicit: matches rank 0's encoder output and gloo's CPU broadcast
+        # contract. Was previously self.device, which on Spyre is the AIU device
+        # — would be wrong if anyone ever changed encoder placement.
+        full_embeds = torch.empty(shape, dtype=dtype, device="cpu")
+        tp_group.broadcast(full_embeds, src=0)
+        t_recv = time.time() - t0
+        logger.info(
+            "rank %d: received MM broadcast for req '%s' in %.2fms",
+            self.rank,
+            req_id,
+            t_recv * 1000,
+        )
+        self.perf_logger.log(
+            "mm_recv_broadcast_ms",
+            t_recv * 1000,
+            phase="prefill",
+            req_id=req_id,
+            rank=self.rank,
+        )
+        return full_embeds
+
+    def _compute_or_broadcast_mm_embeddings(
+        self,
+        prompt_token_ids: list[int],
+        mm_features: list,
+        req_id: str,
+    ) -> torch.Tensor:
+        """Return the multimodal embedding for this request.
+
+        TP=1: run the encoder on the main thread and return.
+
+        TP>1: rank 0 runs the (CPU) vision tower and broadcasts the
+        embedding; peers skip the encoder and receive into a matching
+        buffer. This is the deduplication that closes the original
+        issue (compute once per request instead of once per worker).
+        """
+        world_size = self.parallel_config.world_size
+        if world_size <= 1:
+            full_input_tokens = torch.tensor(
+                prompt_token_ids, dtype=torch.int64, device=self.device
+            ).unsqueeze(0)
+            return self.model.get_maybe_mm_embeddings(
+                full_input_tokens,
+                mm_features=mm_features,
+                is_decode=False,
+            )
+
+        if self.rank == 0:
+            full_input_tokens = torch.tensor(
+                prompt_token_ids, dtype=torch.int64, device=self.device
+            ).unsqueeze(0)
+            return self._mm_encode_and_broadcast(full_input_tokens, mm_features, req_id)
+        return self._mm_receive_broadcast(req_id)
+
     def _prepare_chunked_prefill(self, req_id: str) -> SamplingForwardInputs:
         """
         Cases / Scenarios for the chunked prefill with right padding.
@@ -1035,16 +1184,14 @@ class ChunkedPrefillModelRunner(
         # and cache them, then slice per chunk. This ensures image features are
         # correctly aligned across all chunks.
         if mm_features and request.cached_mm_embeddings is None:
-            # First chunk: compute full multimodal embeddings
-            full_input_tokens = torch.tensor(
-                prompt_token_ids, dtype=torch.int64, device=self.device
-            ).unsqueeze(0)
-
+            # First chunk: compute full multimodal embeddings. Under TP only
+            # rank 0 runs the (CPU) vision tower; peers receive the result via
+            # broadcast and skip the encoder.
             t0 = time.time()
-            full_embeds = self.model.get_maybe_mm_embeddings(
-                full_input_tokens,
+            full_embeds = self._compute_or_broadcast_mm_embeddings(
+                prompt_token_ids,
                 mm_features=mm_features,
-                is_decode=False,
+                req_id=req_id,
             )
 
             t_elapsed = time.time() - t0
@@ -1056,6 +1203,7 @@ class ChunkedPrefillModelRunner(
                 phase="prefill",
                 has_mm_features=True,
                 req_id=req_id,
+                rank=self.rank,
             )
 
             # Cache the full embeddings for subsequent chunks
